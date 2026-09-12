@@ -56,6 +56,77 @@ struct ExecutionTests {
         #expect(results == [.i32(42)])
     }
 
+    @Test
+    func memoryGrowKeepsReservedStorageAndZeroesNewPages() throws {
+        let module = try parseWasm(
+            bytes: wat2wasm(
+                """
+                (module
+                    (memory (export "memory") 1 4)
+                    (func (export "grow") (param i32) (result i32)
+                        (memory.grow (local.get 0))
+                    )
+                )
+                """
+            )
+        )
+        let engine = Engine()
+        let store = Store(engine: engine)
+        let instance = try module.instantiate(store: store)
+        let memory = try #require(instance.exports[memory: "memory"])
+        let grow = try #require(instance.exports[function: "grow"])
+
+        let originalAddress = memory.withUnsafeMutableBufferPointer(offset: 0, count: 1) { bytes in
+            bytes[0] = 0xA5
+            return UInt(bitPattern: bytes.baseAddress!)
+        }
+
+        #expect(try grow([.i32(2)]) == [.i32(1)])
+
+        memory.withUnsafeBufferPointer(offset: 0, count: 3 * MemoryEntity.pageSize) { bytes in
+            #expect(UInt(bitPattern: bytes.baseAddress!) == originalAddress)
+            #expect(bytes[0] == 0xA5)
+            #expect(bytes[MemoryEntity.pageSize] == 0)
+            #expect(bytes[3 * MemoryEntity.pageSize - 1] == 0)
+        }
+        #expect(try grow([.i32(2)]) == [.i32(UInt32.max)])
+    }
+
+    @Test
+    func largeMemoryGrowKeepsReservedStorageLazy() throws {
+        let targetPageCount: UInt32 = 32_327
+        let module = try parseWasm(
+            bytes: wat2wasm(
+                """
+                (module
+                    (memory (export "memory") 28 32768)
+                    (func (export "grow") (param i32) (result i32)
+                        (memory.grow (local.get 0))
+                    )
+                )
+                """
+            )
+        )
+        let engine = Engine()
+        let store = Store(engine: engine)
+        let instance = try module.instantiate(store: store)
+        let memory = try #require(instance.exports[memory: "memory"])
+        let grow = try #require(instance.exports[function: "grow"])
+
+        let originalAddress = memory.withUnsafeBufferPointer(offset: 0, count: 1) {
+            UInt(bitPattern: $0.baseAddress!)
+        }
+        #expect(try grow([.i32(targetPageCount - 28)]) == [.i32(28)])
+
+        let finalByteOffset = UInt(targetPageCount) * UInt(MemoryEntity.pageSize) - 1
+        memory.withUnsafeMutableBufferPointer(offset: finalByteOffset, count: 1) { bytes in
+            #expect(UInt(bitPattern: bytes.baseAddress!) == originalAddress + UInt(finalByteOffset))
+            #expect(bytes[0] == 0)
+            bytes[0] = 0x5A
+            #expect(bytes[0] == 0x5A)
+        }
+    }
+
     func expectTrap(_ wat: String, assertTrap: (Trap) throws -> Void) throws {
         let module = try parseWasm(
             bytes: wat2wasm(wat, options: EncodeOptions(nameSection: true))
