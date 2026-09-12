@@ -30,6 +30,7 @@ add_wasmkit_library(WasmKit
   Execution/Execution.swift
   Execution/Function.swift
   Execution/Instances.swift
+  Execution/ReservedLinearMemory.swift
   Execution/IO.swift
   Execution/NameRegistry.swift
   Execution/Profiler.swift

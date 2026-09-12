@@ -464,7 +464,91 @@ struct MemoryEntity: ~Copyable {
         isMemory64 ? UInt64.max : UInt64(1 << 32) / UInt64(pageSize)
     }
 
-    private var storage: UnsafeMutableBufferPointer<UInt8>
+    private struct AllocatedStorage {
+        var buffer: UnsafeMutableBufferPointer<UInt8>
+
+        init(byteSize: Int) {
+            buffer = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: byteSize)
+            if byteSize > 0 {
+                buffer.initialize(repeating: 0)
+            }
+        }
+
+        mutating func grow(to newByteCount: Int) {
+            let oldBuffer = buffer
+            buffer = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: newByteCount)
+            if newByteCount > 0 {
+                buffer.initialize(repeating: 0)
+            }
+            if oldBuffer.count > 0 {
+                buffer.baseAddress!.update(from: oldBuffer.baseAddress!, count: oldBuffer.count)
+            }
+            oldBuffer.deallocate()
+        }
+
+        func deallocate() {
+            buffer.deallocate()
+        }
+    }
+
+    private enum Storage {
+        #if (os(macOS) || os(iOS) || os(Linux)) && (arch(x86_64) || arch(arm64))
+            case reserved(ReservedLinearMemory)
+        #endif
+        case allocated(AllocatedStorage)
+
+        init(initialByteCount: Int, maximumByteCount: Int, isMemory64: Bool) throws {
+            #if (os(macOS) || os(iOS) || os(Linux)) && (arch(x86_64) || arch(arm64))
+                if !isMemory64, maximumByteCount > 0 {
+                    self = .reserved(
+                        try ReservedLinearMemory(
+                            committedSize: initialByteCount,
+                            reservationSize: maximumByteCount
+                        )
+                    )
+                    return
+                }
+            #endif
+            self = .allocated(AllocatedStorage(byteSize: initialByteCount))
+        }
+
+        var buffer: UnsafeMutableBufferPointer<UInt8> {
+            switch self {
+            #if (os(macOS) || os(iOS) || os(Linux)) && (arch(x86_64) || arch(arm64))
+                case .reserved(let memory):
+                    return memory.makeBufferPointer()
+            #endif
+            case .allocated(let storage):
+                return storage.buffer
+            }
+        }
+
+        mutating func grow(to newByteCount: Int) throws {
+            switch self {
+            #if (os(macOS) || os(iOS) || os(Linux)) && (arch(x86_64) || arch(arm64))
+                case .reserved(var memory):
+                    try memory.grow(to: newByteCount)
+                    self = .reserved(memory)
+            #endif
+            case .allocated(var storage):
+                storage.grow(to: newByteCount)
+                self = .allocated(storage)
+            }
+        }
+
+        func deallocate() {
+            switch self {
+            #if (os(macOS) || os(iOS) || os(Linux)) && (arch(x86_64) || arch(arm64))
+                case .reserved(let memory):
+                    memory.deallocate()
+            #endif
+            case .allocated(let storage):
+                storage.deallocate()
+            }
+        }
+    }
+
+    private var storage: Storage
     let maxPageCount: UInt64
     let limit: Limits
 
@@ -473,12 +557,20 @@ struct MemoryEntity: ~Copyable {
         guard try resourceLimiter.limitMemoryGrowth(to: byteSize) else {
             throw Trap(.initialMemorySizeExceedsLimit(byteSize: byteSize))
         }
-        storage = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: byteSize)
-        if byteSize > 0 {
-            storage.initialize(repeating: 0)
-        }
         let defaultMaxPageCount = Self.maxPageCount(isMemory64: memoryType.isMemory64)
-        maxPageCount = memoryType.max ?? defaultMaxPageCount
+        let resolvedMaxPageCount = memoryType.max ?? defaultMaxPageCount
+        let maximumByteCount =
+            memoryType.isMemory64
+            ? byteSize
+            : Int(resolvedMaxPageCount) * Self.pageSize
+        let resolvedStorage = try Storage(
+            initialByteCount: byteSize,
+            maximumByteCount: maximumByteCount,
+            isMemory64: memoryType.isMemory64
+        )
+
+        storage = resolvedStorage
+        maxPageCount = resolvedMaxPageCount
         limit = memoryType
     }
 
@@ -487,21 +579,22 @@ struct MemoryEntity: ~Copyable {
     }
 
     var data: UnsafeBufferPointer<UInt8> {
-        UnsafeBufferPointer(storage)
+        UnsafeBufferPointer(storage.buffer)
     }
 
     var baseAddress: UnsafeMutableRawPointer? {
-        UnsafeMutableRawPointer(storage.baseAddress)
+        UnsafeMutableRawPointer(storage.buffer.baseAddress)
     }
 
     var byteCount: Int {
-        storage.count
+        storage.buffer.count
     }
 
     /// > Note:
     /// <https://webassembly.github.io/spec/core/exec/modules.html#grow-mem>
     mutating func grow(by pageCount: Int, resourceLimiter: any ResourceLimiter) throws -> Value {
-        let newPageCount = storage.count / Self.pageSize + pageCount
+        let currentByteCount = byteCount
+        let newPageCount = currentByteCount / Self.pageSize + pageCount
 
         guard newPageCount <= maxPageCount else {
             return limit.isMemory64 ? .i64((-1 as Int64).unsigned) : .i32((-1 as Int32).unsigned)
@@ -510,17 +603,9 @@ struct MemoryEntity: ~Copyable {
             return limit.isMemory64 ? .i64((-1 as Int64).unsigned) : .i32((-1 as Int32).unsigned)
         }
 
-        let result = Int32(storage.count / MemoryEntity.pageSize).unsigned
-        let oldStorage = storage
+        let result = Int32(currentByteCount / MemoryEntity.pageSize).unsigned
         let newByteCount = newPageCount * MemoryEntity.pageSize
-        storage = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: newByteCount)
-        if newByteCount > 0 {
-            storage.initialize(repeating: 0)
-        }
-        if oldStorage.count > 0 {
-            storage.baseAddress!.update(from: oldStorage.baseAddress!, count: oldStorage.count)
-        }
-        oldStorage.deallocate()
+        try storage.grow(to: newByteCount)
 
         return limit.isMemory64 ? .i64(UInt64(result)) : .i32(result)
     }
@@ -529,14 +614,15 @@ struct MemoryEntity: ~Copyable {
         let (destinationEnd, destinationOverflow) = destination.addingReportingOverflow(count)
         let (sourceEnd, sourceOverflow) = source.addingReportingOverflow(count)
 
-        guard !destinationOverflow, destinationEnd <= storage.count,
-            !sourceOverflow, sourceEnd <= storage.count
+        let buffer = storage.buffer
+        guard !destinationOverflow, destinationEnd <= buffer.count,
+            !sourceOverflow, sourceEnd <= buffer.count
         else {
             throw Trap(.memoryOutOfBounds)
         }
         let count = Int(count)
         guard count > 0 else { return }
-        guard let baseAddress = storage.baseAddress else { return }
+        guard let baseAddress = buffer.baseAddress else { return }
         let destination = Int(destination)
         let source = Int(source)
         if destination < source {
@@ -554,14 +640,15 @@ struct MemoryEntity: ~Copyable {
         let (destinationEnd, destinationOverflow) = destination.addingReportingOverflow(UInt64(count))
         let (sourceEnd, sourceOverflow) = source.addingReportingOverflow(count)
 
-        guard !destinationOverflow, destinationEnd <= storage.count,
+        let buffer = storage.buffer
+        guard !destinationOverflow, destinationEnd <= buffer.count,
             !sourceOverflow, sourceEnd <= segment.data.count
         else {
             throw Trap(.memoryOutOfBounds)
         }
         segment.data.withUnsafeBufferPointer { segment in
             guard
-                let memory = UnsafeMutableRawPointer(storage.baseAddress),
+                let memory = UnsafeMutableRawPointer(buffer.baseAddress),
                 let segment = UnsafeRawPointer(segment.baseAddress)
             else { return }
             let dest = memory.advanced(by: Int(destination))
@@ -572,22 +659,24 @@ struct MemoryEntity: ~Copyable {
 
     mutating func write(offset: Int, bytes: ArraySlice<UInt8>) throws {
         let endOffset = offset + bytes.count
-        guard endOffset <= storage.count else {
+        let buffer = storage.buffer
+        guard endOffset <= buffer.count else {
             throw Trap(.memoryOutOfBounds)
         }
         guard bytes.count > 0 else { return }
         bytes.withUnsafeBufferPointer { source in
-            storage.baseAddress!.advanced(by: offset).update(from: source.baseAddress!, count: bytes.count)
+            buffer.baseAddress!.advanced(by: offset).update(from: source.baseAddress!, count: bytes.count)
         }
     }
 
     mutating func fill(offset: Int, value: UInt8, count: Int) throws {
         let endOffset = offset + count
-        guard endOffset <= storage.count else {
+        let buffer = storage.buffer
+        guard endOffset <= buffer.count else {
             throw Trap(.memoryOutOfBounds)
         }
         guard count > 0 else { return }
-        storage.baseAddress!.advanced(by: offset).update(repeating: value, count: count)
+        buffer.baseAddress!.advanced(by: offset).update(repeating: value, count: count)
     }
 }
 
