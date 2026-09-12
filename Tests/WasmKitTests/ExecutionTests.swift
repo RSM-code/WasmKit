@@ -93,6 +93,46 @@ struct ExecutionTests {
     }
 
     @Test
+    func memoryGrowAcrossThirtyTwoPageBoundaryKeepsStorageAndZeroesNewPage() throws {
+        let module = try parseWasm(
+            bytes: wat2wasm(
+                """
+                (module
+                    (memory (export "memory") 30 64)
+                    (func (export "grow") (param i32) (result i32)
+                        (memory.grow (local.get 0))
+                    )
+                )
+                """
+            )
+        )
+        let engine = Engine()
+        let store = Store(engine: engine)
+        let instance = try module.instantiate(store: store)
+        let memory = try #require(instance.exports[memory: "memory"])
+        let grow = try #require(instance.exports[function: "grow"])
+
+        let originalAddress = memory.withUnsafeMutableBufferPointer(offset: 0, count: 1) { bytes in
+            bytes[0] = 0xA5
+            return UInt(bitPattern: bytes.baseAddress!)
+        }
+        #expect(try grow([.i32(2)]) == [.i32(30)])
+        #expect(try grow([.i32(1)]) == [.i32(32)])
+
+        let lastByteOffset = UInt(33 * MemoryEntity.pageSize - 1)
+        memory.withUnsafeMutableBufferPointer(offset: lastByteOffset, count: 1) { bytes in
+            #expect(UInt(bitPattern: bytes.baseAddress!) == originalAddress + lastByteOffset)
+            #expect(bytes[0] == 0)
+            bytes[0] = 0x5A
+            #expect(bytes[0] == 0x5A)
+        }
+        memory.withUnsafeBufferPointer(offset: 0, count: 1) { bytes in
+            #expect(UInt(bitPattern: bytes.baseAddress!) == originalAddress)
+            #expect(bytes[0] == 0xA5)
+        }
+    }
+
+    @Test
     func largeMemoryGrowKeepsReservedStorageLazy() throws {
         let targetPageCount: UInt32 = 32_327
         let module = try parseWasm(

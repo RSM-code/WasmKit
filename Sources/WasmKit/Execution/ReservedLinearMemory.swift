@@ -28,10 +28,20 @@
             #else
                 let anonymousFlag = MAP_ANON
             #endif
+            // WasmKit's upstream mprotect-backed strategy is deliberately limited to
+            // macOS and Linux. On iOS, keep the stable lazy reservation readable and
+            // writable while the interpreter enforces the logical committed bound.
+            // Anonymous pages remain demand-zero and consume physical memory only when
+            // touched, without relying on unsupported incremental mprotect behavior.
+            #if os(iOS)
+                let initialProtection = PROT_READ | PROT_WRITE
+            #else
+                let initialProtection = PROT_NONE
+            #endif
             let mapped = mmap(
                 nil,
                 reservationSize,
-                PROT_NONE,
+                initialProtection,
                 MAP_PRIVATE | anonymousFlag,
                 -1,
                 0
@@ -60,11 +70,16 @@
 
             let delta = newCommittedSize - committedSize
             guard delta > 0 else { return }
+            #if os(iOS)
+                committedSize = newCommittedSize
+                return
+            #else
             let start = baseAddress.advanced(by: committedSize)
             guard mprotect(start, delta, PROT_READ | PROT_WRITE) == 0 else {
                 throw Trap(.memoryOutOfBounds)
             }
             committedSize = newCommittedSize
+            #endif
         }
 
         func makeBufferPointer() -> UnsafeMutableBufferPointer<UInt8> {
